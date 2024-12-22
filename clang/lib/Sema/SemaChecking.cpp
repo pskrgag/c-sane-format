@@ -785,6 +785,42 @@ static ExprResult BuiltinDumpStruct(Sema &S, CallExpr *TheCall) {
 }
 
 namespace {
+class FormatModifier {
+  Sema &S;
+  SourceLocation Loc;
+
+public:
+  FormatModifier(Sema &Sema, SourceLocation L) : S(Sema), Loc(L) {}
+
+  virtual std::optional<std::string> ModifyFormat(std::string Format,
+                                                  Expr *E) = 0;
+  virtual ~FormatModifier() {}
+};
+
+class HexModifier : public FormatModifier {
+public:
+  HexModifier(Sema &Sema, SourceLocation L) : FormatModifier(Sema, L) {}
+
+  std::optional<std::string> ModifyFormat(std::string Format,
+                                          Expr *E) override {
+    Format[Format.size() - 1] = 'x';
+    return Format;
+  }
+};
+
+class HashModifier : public FormatModifier {
+public:
+  HashModifier(Sema &Sema, SourceLocation L) : FormatModifier(Sema, L) {}
+
+  std::optional<std::string> ModifyFormat(std::string Format,
+                                          Expr *E) override {
+    Format.insert(1, 1, '#');
+    return Format;
+  }
+};
+
+using FormatModifiers = SmallVector<std::unique_ptr<FormatModifier>, 128>;
+
 struct ParseResultString {
   StringRef String;
 
@@ -793,9 +829,15 @@ struct ParseResultString {
 
 struct ParseResultFormat {
   std::variant<unsigned, StringRef> Format;
+  FormatModifiers Modifiers;
 
-  ParseResultFormat(unsigned pos) : Format(pos) {};
-  ParseResultFormat(StringRef name) : Format(name) {};
+  ParseResultFormat(const ParseResultFormat &) = delete;
+  ParseResultFormat(ParseResultFormat &&) = default;
+
+  ParseResultFormat(unsigned Pos, FormatModifiers Mods)
+      : Format(Pos), Modifiers(std::move(Mods)) {};
+  ParseResultFormat(StringRef Name, FormatModifiers Mods)
+      : Format(Name), Modifiers(std::move(Mods)) {};
 };
 
 using ParseResult = std::variant<ParseResultString, ParseResultFormat>;
@@ -848,12 +890,51 @@ class BuiltinPrintGenerator {
     return ParseResultString(Format.substr(start, StringPos - start));
   }
 
+  std::optional<FormatModifiers> ParseFormatModifiers(StringRef Str) {
+    FormatModifiers Modifiers{};
+
+    for (std::size_t i = 0; i < Str.size(); ++i) {
+      switch (Str[i]) {
+      case 'x':
+        Modifiers.push_back(std::make_unique<HexModifier>(S, Loc));
+        break;
+      case '#':
+        Modifiers.push_back(std::make_unique<HashModifier>(S, Loc));
+        break;
+      default:
+        S.Diag(Loc, diag::err_format_wrong_modifier) << Str[i];
+        return {};
+      }
+    }
+
+    return Modifiers;
+  }
+
+  // This function accepts specifier in following format:
+  //
+  // <output-specifier> [":" <output-modifier>]
   std::optional<ParseResultFormat> ParseOneSpecifier(StringRef Str) {
     auto isNumber = [](StringRef s) {
       return !s.empty() && std::all_of(s.begin(), s.end(), ::isdigit);
     };
 
-    if (isNumber(Str)) {
+    StringRef Modifier;
+    StringRef Output;
+    std::size_t Split = Str.find(':');
+
+    if (Split != StringRef::npos) {
+      Output = Str.substr(0, Split);
+      Modifier = Str.substr(Split + 1);
+    } else {
+      Output = Str;
+      Modifier = "";
+    }
+
+    auto Modifiers = ParseFormatModifiers(Modifier);
+    if (!Modifiers)
+      return {};
+
+    if (isNumber(Output)) {
       unsigned Number;
       auto [ptr, ec] =
           std::from_chars(Str.data(), Str.data() + Str.size(), Number);
@@ -861,11 +942,11 @@ class BuiltinPrintGenerator {
       if (ec != std::errc{})
         return {};
 
-      return ParseResultFormat(Number);
-    } else if (Str.empty()) {
-      return ParseResultFormat(ArgPos++);
+      return ParseResultFormat(Number, std::move(*Modifiers));
+    } else if (Output.empty()) {
+      return ParseResultFormat(ArgPos++, std::move(*Modifiers));
     } else {
-      return ParseResultFormat(Str);
+      return ParseResultFormat(Output, std::move(*Modifiers));
     }
   }
 
@@ -912,7 +993,7 @@ class BuiltinPrintGenerator {
     switch (*current) {
     case '{':
       if (auto res = FormatFromCurrent())
-        return ParseResult(*res);
+        return ParseResult(std::move(*res));
 
       return {};
     default:
@@ -956,6 +1037,18 @@ class BuiltinPrintGenerator {
 
   std::optional<std::string>
   GenerateStringForSpecifier(const ParseResultFormat &Format) {
+    auto ApplyModifiers = [](const ParseResultFormat &Format, std::string Str,
+                             Expr *E) -> std::optional<std::string> {
+      for (const auto &Mod : Format.Modifiers) {
+        if (auto Res = Mod->ModifyFormat(Str, E))
+          Str = *Res;
+        else
+          return {};
+      }
+
+      return Str;
+    };
+
     if (const auto *Res = std::get_if<StringRef>(&Format.Format)) {
       ASTContext &Ctx = S.getASTContext();
       auto Name = &Ctx.Idents.get(*Res);
@@ -983,7 +1076,7 @@ class BuiltinPrintGenerator {
       if (auto Result = GenerateStringForExpr(DF)) {
         Var->markUsed(Ctx);
         Args.push_back(DF);
-        return *Result;
+        return ApplyModifiers(Format, *Result, DF);
       }
     } else if (const auto *Res = std::get_if<unsigned>(&Format.Format)) {
       if (*Res >= TheCall->getNumArgs()) {
@@ -992,9 +1085,9 @@ class BuiltinPrintGenerator {
       }
 
       Expr *Arg = TheCall->getArg(2 + *Res);
-      if (auto Res = GenerateStringForExpr(Arg)) {
+      if (auto Result = GenerateStringForExpr(Arg)) {
         Args.push_back(Arg);
-        return *Res;
+        return ApplyModifiers(Format, *Result, Arg);
       }
     }
 

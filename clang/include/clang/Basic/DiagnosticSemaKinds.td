@@ -6052,6 +6052,7 @@ def err_format_index_out_of_range: Error<"positional specifier %0 is out-of-rang
 def err_format_unknown_type: Error<"unable to find printf specifier for type %0">;
 def err_format_wrong_format_type: Error<"expected string literal as 1st argument">;
 def err_format_wrong_print_fn: Error<"expected printf-like function as 2nd argument">;
+def err_format_wrong_modifier: Error<"unknown modifier %0 for format string">;
 
 def warn_var_decl_not_read_only : Warning<
   "object of type %0 cannot be placed in read-only memory">,
