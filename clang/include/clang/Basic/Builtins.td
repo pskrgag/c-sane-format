@@ -4356,6 +4356,12 @@ def BuiltinDumpStruct : Builtin {
   let Prototype = "void(...)";
 }
 
+def BuiltinPrint: Builtin {
+  let Spellings = ["__builtin_print"];
+  let Attributes = [CustomTypeChecking];
+  let Prototype = "void(char const*, ...)";
+}
+
 def BuiltinPreserveAccessIndex : Builtin {
   let Spellings = ["__builtin_preserve_access_index"];
   let Attributes = [CustomTypeChecking];

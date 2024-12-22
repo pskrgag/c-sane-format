@@ -6046,6 +6046,12 @@ def err_new_abi_tag_on_redeclaration : Error<
   "'abi_tag' %0 missing in original declaration">;
 def note_use_ifdef_guards : Note<
   "unguarded header; consider using #ifdef guards or #pragma once">;
+def err_format_string_unmatched_brace : Error<"unmatched '{' in format string st pos %0">;
+def err_format_string_non_variable : Error<"cannot print non-variable">;
+def err_format_index_out_of_range: Error<"positional specifier %0 is out-of-range">;
+def err_format_unknown_type: Error<"unable to find printf specifier for type %0">;
+def err_format_wrong_format_type: Error<"expected string literal as 1st argument">;
+def err_format_wrong_print_fn: Error<"expected printf-like function as 2nd argument">;
 
 def warn_var_decl_not_read_only : Warning<
   "object of type %0 cannot be placed in read-only memory">,

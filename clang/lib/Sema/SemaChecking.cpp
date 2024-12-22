@@ -102,6 +102,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cctype>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -781,6 +782,319 @@ static ExprResult BuiltinDumpStruct(Sema &S, CallExpr *TheCall) {
     return ExprError();
 
   return Generator.buildWrapper();
+}
+
+namespace {
+struct ParseResultString {
+  StringRef String;
+
+  ParseResultString(StringRef str) : String(str) {}
+};
+
+struct ParseResultFormat {
+  std::variant<unsigned, StringRef> Format;
+
+  ParseResultFormat(unsigned pos) : Format(pos) {};
+  ParseResultFormat(StringRef name) : Format(name) {};
+};
+
+using ParseResult = std::variant<ParseResultString, ParseResultFormat>;
+
+class BuiltinPrintFormatParser {
+  StringRef Format;
+
+public:
+  BuiltinPrintFormatParser(StringRef fmt) : Format(fmt) {}
+};
+
+class BuiltinPrintGenerator {
+  Sema &S;
+  CallExpr *TheCall;
+  DiagnosticErrorTrap ErrorTracker;
+  StringRef Format =
+      llvm::dyn_cast_or_null<StringLiteral>(TheCall->getArg(0))->getString();
+  SourceLocation Loc = TheCall->getBeginLoc();
+  std::size_t StringPos = 0;
+  std::size_t ArgPos = 0;
+  SmallVector<Expr *, 32> Args;
+
+  // Maps string representation of Type to type specifier
+  static const llvm::DenseMap<BuiltinType::Kind, StringRef> TypeSpecifiers;
+
+  std::optional<char> Peek() {
+    if (StringPos < Format.size())
+      return Format[StringPos];
+
+    return {};
+  }
+
+  std::optional<char> Get() {
+    if (StringPos < Format.size())
+      return Format[StringPos++];
+
+    return {};
+  }
+
+  ParseResultString StringFromCurrent() {
+    std::size_t start = StringPos;
+
+    while (auto cur = Peek()) {
+      if (cur == '{' || cur == '}')
+        break;
+
+      Get();
+    }
+
+    return ParseResultString(Format.substr(start, StringPos - start));
+  }
+
+  std::optional<ParseResultFormat> ParseOneSpecifier(StringRef Str) {
+    auto isNumber = [](StringRef s) {
+      return !s.empty() && std::all_of(s.begin(), s.end(), ::isdigit);
+    };
+
+    if (isNumber(Str)) {
+      unsigned Number;
+      auto [ptr, ec] =
+          std::from_chars(Str.data(), Str.data() + Str.size(), Number);
+
+      if (ec != std::errc{})
+        return {};
+
+      return ParseResultFormat(Number);
+    } else if (Str.empty()) {
+      return ParseResultFormat(ArgPos++);
+    } else {
+      return ParseResultFormat(Str);
+    }
+  }
+
+  std::optional<ParseResultFormat> FormatFromCurrent() {
+    assert(*Peek() == '{');
+
+    // Consume starting {
+    Get();
+
+    std::size_t start = StringPos;
+
+    while (auto cur = Peek()) {
+      if (cur == '}') {
+        break;
+      }
+
+      Get();
+    }
+
+    StringRef specifier = Format.substr(start, StringPos - start);
+
+    // Consume matching }
+    if (auto current = Get()) {
+      assert(*current == '}');
+    } else {
+      S.Diag(Loc, diag::err_format_string_unmatched_brace) << start;
+      return {};
+    }
+
+    return ParseOneSpecifier(specifier);
+  }
+
+  // The format string has following rules
+  //
+  // {<name>} is replaced with specifier for <name>
+  // {}       is replaced with specifier for argument with index equal to number 
+  //          of '{}' predecessors 
+  // {<n>}    is replaced with specifier for argument with index <n>
+  std::optional<ParseResult> ParseOne() {
+    auto current = Peek();
+    if (!current)
+      return std::nullopt;
+
+    switch (*current) {
+    case '{':
+      if (auto res = FormatFromCurrent())
+        return ParseResult(*res);
+
+      return {};
+    default:
+      return ParseResult(StringFromCurrent());
+    }
+  }
+
+  std::optional<std::string>
+  GenerateStringForExpr(const Expr *E) {
+      QualType OrigType = E->getType();
+      QualType UQType = OrigType.getUnqualifiedType();
+
+      if (UQType->canDecayToPointerType())
+        UQType = S.Context.getDecayedType(UQType);
+
+      auto TypeName = UQType.getAsString();
+
+      // Special treatment for pointers (which include char * after decay)
+      if (UQType->isPointerType()) {
+          if (UQType->getPointeeType() == S.getASTContext().CharTy)
+             return "%s";
+
+          return "%p";
+      }
+
+      if (!UQType->isBuiltinType()) {
+        S.Diag(Loc, diag::err_format_unknown_type) << TypeName;
+        return {};
+      }
+
+      if (const BuiltinType *BIType = cast<BuiltinType>(UQType)) {
+        if (TypeSpecifiers.contains(BIType->getKind())) {
+          return std::string(TypeSpecifiers.at(BIType->getKind()));
+        } else {
+          S.Diag(Loc, diag::err_format_unknown_type) << TypeName;
+        }
+      }
+
+      return {};
+  }
+
+  std::optional<std::string>
+  GenerateStringForSpecifier(const ParseResultFormat &Format) {
+    if (const auto *Res = std::get_if<StringRef>(&Format.Format)) {
+      ASTContext &Ctx = S.getASTContext();
+      auto Name = &Ctx.Idents.get(*Res);
+      LookupResult VarResult(S, Name, SourceLocation(),
+                             Sema::LookupOrdinaryName);
+
+      S.LookupName(VarResult, S.TUScope, /*AllowBuiltinCreation=*/false,
+                   /*ForceNoCPlusPlus=*/false);
+
+      if (VarResult.empty()) {
+        S.Diag(Loc, diag::err_undeclared_var_use) << Name;
+        return {};
+      }
+
+      auto Var = llvm::dyn_cast_or_null<VarDecl>(VarResult.getFoundDecl());
+      if (!Var) {
+        S.Diag(Loc, diag::err_format_string_non_variable);
+        return {};
+      }
+
+      // Create a DeclRefExpr that refers to variable
+      DeclRefExpr *DF =
+          new (Ctx) DeclRefExpr(Ctx, Var, false, Var->getType(), VK_LValue, Loc);
+
+      if (auto Result = GenerateStringForExpr(DF)) {
+        Var->markUsed(Ctx);
+        Args.push_back(DF);
+        return *Result;
+      }
+    } else if (const auto *Res = std::get_if<unsigned>(&Format.Format)) {
+      if (*Res >= TheCall->getNumArgs()) {
+        S.Diag(Loc, diag::err_format_index_out_of_range) << *Res;
+        return {};
+      }
+
+      Expr *Arg = TheCall->getArg(2 + *Res);
+      if (auto Res = GenerateStringForExpr(Arg)) {
+        Args.push_back(Arg);
+        return *Res;
+      }
+    }
+
+    return {};
+  }
+
+public:
+  BuiltinPrintGenerator(Sema &S, CallExpr *TheCall)
+      : S(S), TheCall(TheCall), ErrorTracker(S.getDiagnostics()) {}
+
+  std::optional<std::string> GeneratePrintfFormat() {
+    std::string ResStr;
+
+    while (auto Step = ParseOne()) {
+      if (const auto *Res = std::get_if<ParseResultString>(&*Step)) {
+        ResStr += std::string_view(Res->String);
+      } else if (const auto *Res = std::get_if<ParseResultFormat>(&*Step)) {
+        if (auto Str = GenerateStringForSpecifier(*Res))
+          ResStr += *Str;
+        else
+          return {};
+      }
+    }
+
+    return ResStr;
+  }
+
+  Expr *BuildCall(StringRef Str) {
+    ASTContext &Context = S.getASTContext();
+    QualType StrTy =
+        Context.getStringLiteralArrayType(Context.CharTy, Str.size());
+    StringLiteral *Format =
+        StringLiteral::Create(Context, Str, StringLiteralKind::Ordinary, false,
+                              StrTy, &Loc, Str.size());
+    SmallVector<Expr *, 32> RealArgs;
+
+    RealArgs.push_back(Format);
+    RealArgs.append(Args);
+
+    ExprResult RealCall = S.BuildCallExpr(/*Scope=*/nullptr, TheCall->getArg(1),
+                                          TheCall->getBeginLoc(), RealArgs,
+                                          TheCall->getRParenLoc());
+    if (RealCall.isInvalid())
+      return nullptr;
+
+    auto *Wrapper = PseudoObjectExpr::Create(
+        S.Context, TheCall, {RealCall.get()}, PseudoObjectExpr::NoResult);
+    TheCall->setType(Wrapper->getType());
+    TheCall->setValueKind(Wrapper->getValueKind());
+    return Wrapper;
+  }
+};
+
+const llvm::DenseMap<BuiltinType::Kind, StringRef>
+    BuiltinPrintGenerator::TypeSpecifiers = {
+        {BuiltinType::Char_S, "%c"},
+        {BuiltinType::Char_U, "%c"},
+        {BuiltinType::Short, "%hd"},
+        {BuiltinType::UShort, "%hu"},
+        {BuiltinType::Int, "%d"},
+        {BuiltinType::UInt, "%u"},
+        {BuiltinType::Long, "%ld"},
+        {BuiltinType::ULong, "%lu"},
+        {BuiltinType::LongLong, "%lld"},
+        {BuiltinType::ULongLong, "%llu"},
+};
+} // namespace
+
+static ExprResult BuiltinPrint(Sema &S, CallExpr *TheCall) {
+  if (S.checkArgCountAtLeast(TheCall, 2))
+    return ExprError();
+
+  ExprResult PtrArgResult = S.DefaultLvalueConversion(TheCall->getArg(0));
+  if (PtrArgResult.isInvalid())
+    return ExprError();
+
+  const StringLiteral *StringLit =
+      llvm::dyn_cast_or_null<StringLiteral>(TheCall->getArg(0));
+  if (!StringLit) {
+    S.Diag(TheCall->getBeginLoc(), diag::err_format_wrong_format_type);
+    return ExprError();
+  }
+
+  QualType FnArgType = TheCall->getArg(1)->getType();
+  if (!(FnArgType->isFunctionPointerType() ||
+        FnArgType->isFunctionProtoType())) {
+    S.Diag(TheCall->getBeginLoc(), diag::err_format_wrong_print_fn);
+    return ExprError();
+  }
+
+  /* TODO: also add check for function signature */
+
+  BuiltinPrintGenerator generator(S, TheCall);
+  auto NewFormat = generator.GeneratePrintfFormat();
+  if (!NewFormat)
+    return ExprError();
+
+  llvm::errs() << "Format string = " << NewFormat << '\n';
+
+  return generator.BuildCall(*NewFormat);
 }
 
 static bool BuiltinCallWithStaticChain(Sema &S, CallExpr *BuiltinCall) {
@@ -2490,6 +2804,8 @@ Sema::CheckBuiltinFunctionCall(FunctionDecl *FDecl, unsigned BuiltinID,
   }
   case Builtin::BI__builtin_dump_struct:
     return BuiltinDumpStruct(*this, TheCall);
+  case Builtin::BI__builtin_print:
+    return BuiltinPrint(*this, TheCall);
   case Builtin::BI__builtin_expect_with_probability: {
     // We first want to ensure we are called with 3 arguments
     if (checkArgCount(TheCall, 3))

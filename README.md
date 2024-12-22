@@ -1,44 +1,44 @@
-# The LLVM Compiler Infrastructure
+# Sane formatting for C
 
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/llvm/llvm-project/badge)](https://securityscorecards.dev/viewer/?uri=github.com/llvm/llvm-project)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/8273/badge)](https://www.bestpractices.dev/projects/8273)
-[![libc++](https://github.com/llvm/llvm-project/actions/workflows/libcxx-build-and-test.yaml/badge.svg?branch=main&event=schedule)](https://github.com/llvm/llvm-project/actions/workflows/libcxx-build-and-test.yaml?query=event%3Aschedule)
+This is work-in-progress support for sane formatting in C clang front-end. Not intended
+to be upstreamed (yet).
 
-Welcome to the LLVM project!
+Support is added as new builtin, which parses rust-like formatting string and passes
+appropriate format specifiers to backing printf-like function.
 
-This repository contains the source code for LLVM, a toolkit for the
-construction of highly optimized compilers, optimizers, and run-time
-environments.
+New builtin has following signature:
 
-The LLVM project has multiple components. The core of the project is
-itself called "LLVM". This contains all of the tools, libraries, and header
-files needed to process intermediate representations and convert them into
-object files. Tools include an assembler, disassembler, bitcode analyzer, and
-bitcode optimizer.
+```c
+void __builtin_print(const char *fmt, int (*printf)(const char *fmt, ...), ...);
+```
 
-C-like languages use the [Clang](https://clang.llvm.org/) frontend. This
-component compiles C, C++, Objective-C, and Objective-C++ code into LLVM bitcode
--- and from there into object files, using LLVM.
+(For now type of the function is not checked, but it definitely will).
 
-Other components include:
-the [libc++ C++ standard library](https://libcxx.llvm.org),
-the [LLD linker](https://lld.llvm.org), and more.
+It could be used in following ways:
 
-## Getting the Source Code and Building LLVM
+```c
+    // Argument without position
+    int a = 10;
+    __builtin_print("{}\n", printf, a); // prints "10"
+```
 
-Consult the
-[Getting Started with LLVM](https://llvm.org/docs/GettingStarted.html#getting-the-source-code-and-building-llvm)
-page for information on building and running LLVM.
+```c
+    // String interpolation
+    int a = 10;
+    __builtin_print("{a}\n", printf); // prints "10"
+```
 
-For information on how to contribute to the LLVM project, please take a look at
-the [Contributing to LLVM](https://llvm.org/docs/Contributing.html) guide.
+```c
+    // Positional arguments
+    int a = 10 , b = 20;
+    __builtin_print("{a} + {b} = {0}\n", printf, a + b); // prints "10 + 20 = 30"
+    __builtin_print("{1} + {0} = {2}\n", printf, a, b, a + b); // prints "20 + 10 = 30"
+```
 
-## Getting in touch
+Planning to add support for custom format specifiers:
+    - Hex (if makes sense)
+    - String modifications
+    - ...
 
-Join the [LLVM Discourse forums](https://discourse.llvm.org/), [Discord
-chat](https://discord.gg/xS7Z362),
-[LLVM Office Hours](https://llvm.org/docs/GettingInvolved.html#office-hours) or
-[Regular sync-ups](https://llvm.org/docs/GettingInvolved.html#online-sync-ups).
-
-The LLVM project has adopted a [code of conduct](https://llvm.org/docs/CodeOfConduct.html) for
-participants to all modes of communication within the project.
+Also wondering if there could be some kind of "specifiers database", which could be loaded into
+clang. This will be definitely useful for project with custom formatting (like Linux Kernel)
