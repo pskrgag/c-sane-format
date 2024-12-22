@@ -108,6 +108,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -785,41 +786,54 @@ static ExprResult BuiltinDumpStruct(Sema &S, CallExpr *TheCall) {
 }
 
 namespace {
-class FormatModifier {
-  Sema &S;
-  SourceLocation Loc;
+class PeekableStringRef {
+  StringRef Ref;
+  std::size_t StringPos;
 
 public:
-  FormatModifier(Sema &Sema, SourceLocation L) : S(Sema), Loc(L) {}
+  PeekableStringRef(StringRef R) : Ref(R), StringPos(0) {}
 
-  virtual std::optional<std::string> ModifyFormat(std::string Format,
-                                                  Expr *E) = 0;
-  virtual ~FormatModifier() {}
-};
+  std::optional<char> Peek() {
+    if (StringPos < Ref.size())
+      return Ref[StringPos];
 
-class HexModifier : public FormatModifier {
-public:
-  HexModifier(Sema &Sema, SourceLocation L) : FormatModifier(Sema, L) {}
+    return {};
+  }
 
-  std::optional<std::string> ModifyFormat(std::string Format,
-                                          Expr *E) override {
-    Format[Format.size() - 1] = 'x';
-    return Format;
+  std::optional<char> Get() {
+    if (StringPos < Ref.size())
+      return Ref[StringPos++];
+
+    return {};
+  }
+
+  std::optional<char> GetPred(std::function<bool(char)> Fn) {
+    if (StringPos < Ref.size() && Fn(Ref[StringPos]))
+      return Ref[StringPos++];
+
+    return {};
+  }
+
+  std::optional<std::size_t> SkipPred(std::function<bool(char)> Fn) {
+    while (GetPred(Fn)) {
+    }
+
+    return {};
+  }
+
+  std::optional<char> GetChar(char c) {
+    if (StringPos < Ref.size() && Ref[StringPos] == c)
+      return Ref[StringPos++];
+
+    return {};
+  }
+
+  std::size_t CurrentOffset() const { return StringPos; }
+
+  StringRef SubStrFrom(std::size_t Start) const {
+    return Ref.substr(Start, StringPos - Start);
   }
 };
-
-class HashModifier : public FormatModifier {
-public:
-  HashModifier(Sema &Sema, SourceLocation L) : FormatModifier(Sema, L) {}
-
-  std::optional<std::string> ModifyFormat(std::string Format,
-                                          Expr *E) override {
-    Format.insert(1, 1, '#');
-    return Format;
-  }
-};
-
-using FormatModifiers = SmallVector<std::unique_ptr<FormatModifier>, 128>;
 
 struct ParseResultString {
   StringRef String;
@@ -827,17 +841,22 @@ struct ParseResultString {
   ParseResultString(StringRef str) : String(str) {}
 };
 
+struct FormatModifiers {
+  bool Hex;
+  bool Dash;
+  unsigned LeadingZeros;
+  unsigned LeadingSpace;
+  unsigned TrailingSpace;
+};
+
 struct ParseResultFormat {
-  std::variant<unsigned, StringRef> Format;
+  std::variant<unsigned, StringRef> Argument;
   FormatModifiers Modifiers;
 
-  ParseResultFormat(const ParseResultFormat &) = delete;
-  ParseResultFormat(ParseResultFormat &&) = default;
-
-  ParseResultFormat(unsigned Pos, FormatModifiers Mods)
-      : Format(Pos), Modifiers(std::move(Mods)) {};
-  ParseResultFormat(StringRef Name, FormatModifiers Mods)
-      : Format(Name), Modifiers(std::move(Mods)) {};
+  ParseResultFormat(unsigned Pos, FormatModifiers Mods = {})
+      : Argument(Pos), Modifiers(Mods) {};
+  ParseResultFormat(StringRef Name, FormatModifiers Mods = {})
+      : Argument(Name), Modifiers(Mods) {};
 };
 
 using ParseResult = std::variant<ParseResultString, ParseResultFormat>;
@@ -853,56 +872,102 @@ class BuiltinPrintGenerator {
   Sema &S;
   CallExpr *TheCall;
   DiagnosticErrorTrap ErrorTracker;
-  StringRef Format =
+  PeekableStringRef Format =
       llvm::dyn_cast_or_null<StringLiteral>(TheCall->getArg(0))->getString();
   SourceLocation Loc = TheCall->getBeginLoc();
-  std::size_t StringPos = 0;
   std::size_t ArgPos = 0;
   SmallVector<Expr *, 32> Args;
 
   // Maps string representation of Type to type specifier
   static const llvm::DenseMap<BuiltinType::Kind, StringRef> TypeSpecifiers;
 
-  std::optional<char> Peek() {
-    if (StringPos < Format.size())
-      return Format[StringPos];
-
-    return {};
+  bool isStringPointer(QualType Type) {
+    return Type->getPointeeType() == S.getASTContext().CharTy;
   }
 
-  std::optional<char> Get() {
-    if (StringPos < Format.size())
-      return Format[StringPos++];
-
-    return {};
+  // Type should be already decayed, so no need to check for arrays
+  bool isSupportedType(QualType Type) {
+    return Type->isPointerType() || Type->isBuiltinType();
   }
 
   ParseResultString StringFromCurrent() {
-    std::size_t start = StringPos;
+    std::size_t start = Format.CurrentOffset();
 
-    while (auto cur = Peek()) {
-      if (cur == '{' || cur == '}')
-        break;
-
-      Get();
+    while (Format.GetPred([](char c) { return !(c == '{' || c == '}'); })) {
     }
 
-    return ParseResultString(Format.substr(start, StringPos - start));
+    return ParseResultString(Format.SubStrFrom(start));
+  }
+
+  std::optional<unsigned> ExtractNumber(StringRef Str) {
+    std::size_t start = 0, i = 0;
+
+    while (i < Str.size() && std::isdigit(Str[i]))
+      i++;
+
+    unsigned Num;
+    auto [ptr, ec] = std::from_chars(Str.data() + start, Str.data() + i, Num);
+    if (ec != std::errc{})
+      return {};
+
+    return Num;
   }
 
   std::optional<FormatModifiers> ParseFormatModifiers(StringRef Str) {
     FormatModifiers Modifiers{};
+    PeekableStringRef Spec(Str);
+    auto GetNumber = [&Spec, this]() {
+      std::size_t Cur = Spec.CurrentOffset();
 
-    for (std::size_t i = 0; i < Str.size(); ++i) {
-      switch (Str[i]) {
+      Spec.SkipPred([](char c) { return std::isdigit(c); });
+      return ExtractNumber(Spec.SubStrFrom(Cur));
+    };
+
+    while (auto c = Spec.Peek()) {
+      if (*c != '0' && std::isdigit(*c)) {
+        if (auto Num = GetNumber()) {
+          Modifiers.LeadingSpace = *Num;
+        } else {
+          return {};
+        }
+
+        Spec.Get();
+        continue;
+      }
+
+      switch (*c) {
       case 'x':
-        Modifiers.push_back(std::make_unique<HexModifier>(S, Loc));
+        Modifiers.Hex = true;
+        Spec.Get();
         break;
       case '#':
-        Modifiers.push_back(std::make_unique<HashModifier>(S, Loc));
+        Modifiers.Dash = true;
+        Spec.Get();
         break;
+      case '0': {
+        std::size_t Cur = Spec.CurrentOffset();
+
+        Spec.SkipPred([](char c) { return c == '0'; });
+
+        if (auto Num = GetNumber()) {
+          Modifiers.LeadingZeros = *Num;
+        } else {
+          return {};
+        }
+        break;
+      }
+      case '-': {
+        Spec.Get();
+
+        if (auto Num = GetNumber()) {
+          Modifiers.TrailingSpace = *Num;
+        } else {
+          return {};
+        }
+        break;
+      }
       default:
-        S.Diag(Loc, diag::err_format_wrong_modifier) << Str[i];
+        S.Diag(Loc, diag::err_format_wrong_modifier) << *c;
         return {};
       }
     }
@@ -942,34 +1007,25 @@ class BuiltinPrintGenerator {
       if (ec != std::errc{})
         return {};
 
-      return ParseResultFormat(Number, std::move(*Modifiers));
+      return ParseResultFormat(Number, *Modifiers);
     } else if (Output.empty()) {
-      return ParseResultFormat(ArgPos++, std::move(*Modifiers));
+      return ParseResultFormat(ArgPos++, *Modifiers);
     } else {
-      return ParseResultFormat(Output, std::move(*Modifiers));
+      return ParseResultFormat(Output, *Modifiers);
     }
   }
 
   std::optional<ParseResultFormat> FormatFromCurrent() {
-    assert(*Peek() == '{');
+    Format.GetChar('{');
+    std::size_t start = Format.CurrentOffset();
 
-    // Consume starting {
-    Get();
-
-    std::size_t start = StringPos;
-
-    while (auto cur = Peek()) {
-      if (cur == '}') {
-        break;
-      }
-
-      Get();
+    while (auto cur = Format.GetPred([](char c) { return c != '}'; })) {
     }
 
-    StringRef specifier = Format.substr(start, StringPos - start);
+    StringRef specifier = Format.SubStrFrom(start);
 
     // Consume matching }
-    if (auto current = Get()) {
+    if (auto current = Format.Get()) {
       assert(*current == '}');
     } else {
       S.Diag(Loc, diag::err_format_string_unmatched_brace) << start;
@@ -986,7 +1042,7 @@ class BuiltinPrintGenerator {
   //          of '{}' predecessors 
   // {<n>}    is replaced with specifier for argument with index <n>
   std::optional<ParseResult> ParseOne() {
-    auto current = Peek();
+    auto current = Format.Peek();
     if (!current)
       return std::nullopt;
 
@@ -1001,55 +1057,80 @@ class BuiltinPrintGenerator {
     }
   }
 
-  std::optional<std::string>
-  GenerateStringForExpr(const Expr *E) {
-      QualType OrigType = E->getType();
-      QualType UQType = OrigType.getUnqualifiedType();
+  bool SanityCheckModifiers(const FormatModifiers &Mods, QualType Type) {
+    return true;
+  }
 
-      if (UQType->canDecayToPointerType())
-        UQType = S.Context.getDecayedType(UQType);
+  // Pre-format modifiers like '#' or '02'
+  std::string GeneratePreFormatModifiers(const FormatModifiers &Mods,
+                                         QualType Type) {
+    std::ostringstream Stream;
 
-      auto TypeName = UQType.getAsString();
+    if (Mods.TrailingSpace)
+      Stream << Mods.TrailingSpace;
 
-      // Special treatment for pointers (which include char * after decay)
-      if (UQType->isPointerType()) {
-          if (UQType->getPointeeType() == S.getASTContext().CharTy)
-             return "%s";
+    if (Mods.LeadingSpace)
+      Stream << '-' << Mods.LeadingSpace;
 
-          return "%p";
-      }
+    if (Mods.LeadingZeros)
+      Stream << '0' << Mods.LeadingZeros;
 
-      if (!UQType->isBuiltinType()) {
+    if (Mods.Dash)
+      Stream << '#';
+
+    return Stream.str();
+  }
+
+  std::optional<std::string> GenerateStringForExpr(const FormatModifiers &Mods,
+                                                   const Expr *E) {
+    QualType OrigType = E->getType();
+    QualType UQType = OrigType.getUnqualifiedType();
+    std::string Result = "%";
+
+    if (UQType->canDecayToPointerType())
+      UQType = S.Context.getDecayedType(UQType);
+
+    auto TypeName = UQType.getAsString();
+
+    if (!isSupportedType(UQType)) {
+      S.Diag(Loc, diag::err_format_unknown_type) << TypeName;
+      return {};
+    }
+
+    // Now UQType hold the type that will be passed to backed print function.
+    if (!SanityCheckModifiers(Mods, UQType))
+      return {};
+
+    Result += GeneratePreFormatModifiers(Mods, UQType);
+
+    // Special treatment for pointers (which include char * after decay)
+    if (UQType->isPointerType()) {
+      if (UQType->getPointeeType() == S.getASTContext().CharTy)
+        Result += "s";
+      else
+        Result += "p";
+    } else {
+      const BuiltinType *BIType = cast<BuiltinType>(UQType);
+
+      if (TypeSpecifiers.contains(BIType->getKind())) {
+        Result += std::string(TypeSpecifiers.at(BIType->getKind()));
+
+        if (Mods.Hex)
+          Result[Result.size() - 1] = 'x';
+      } else {
         S.Diag(Loc, diag::err_format_unknown_type) << TypeName;
         return {};
       }
+    }
 
-      if (const BuiltinType *BIType = cast<BuiltinType>(UQType)) {
-        if (TypeSpecifiers.contains(BIType->getKind())) {
-          return std::string(TypeSpecifiers.at(BIType->getKind()));
-        } else {
-          S.Diag(Loc, diag::err_format_unknown_type) << TypeName;
-        }
-      }
-
-      return {};
+    return Result;
   }
 
   std::optional<std::string>
-  GenerateStringForSpecifier(const ParseResultFormat &Format) {
-    auto ApplyModifiers = [](const ParseResultFormat &Format, std::string Str,
-                             Expr *E) -> std::optional<std::string> {
-      for (const auto &Mod : Format.Modifiers) {
-        if (auto Res = Mod->ModifyFormat(Str, E))
-          Str = *Res;
-        else
-          return {};
-      }
+  GenerateStringForSpecifier(const ParseResultFormat &ParseFormat) {
+    std::string ResultFormat = "%";
 
-      return Str;
-    };
-
-    if (const auto *Res = std::get_if<StringRef>(&Format.Format)) {
+    if (const auto *Res = std::get_if<StringRef>(&ParseFormat.Argument)) {
       ASTContext &Ctx = S.getASTContext();
       auto Name = &Ctx.Idents.get(*Res);
       LookupResult VarResult(S, Name, SourceLocation(),
@@ -1073,21 +1154,21 @@ class BuiltinPrintGenerator {
       DeclRefExpr *DF =
           new (Ctx) DeclRefExpr(Ctx, Var, false, Var->getType(), VK_LValue, Loc);
 
-      if (auto Result = GenerateStringForExpr(DF)) {
+      if (auto Result = GenerateStringForExpr(ParseFormat.Modifiers, DF)) {
         Var->markUsed(Ctx);
         Args.push_back(DF);
-        return ApplyModifiers(Format, *Result, DF);
+        return *Result;
       }
-    } else if (const auto *Res = std::get_if<unsigned>(&Format.Format)) {
+    } else if (const auto *Res = std::get_if<unsigned>(&ParseFormat.Argument)) {
       if (*Res >= TheCall->getNumArgs()) {
         S.Diag(Loc, diag::err_format_index_out_of_range) << *Res;
         return {};
       }
 
       Expr *Arg = TheCall->getArg(2 + *Res);
-      if (auto Result = GenerateStringForExpr(Arg)) {
+      if (auto Result = GenerateStringForExpr(ParseFormat.Modifiers, Arg)) {
         Args.push_back(Arg);
-        return ApplyModifiers(Format, *Result, Arg);
+        return *Result;
       }
     }
 
@@ -1143,16 +1224,11 @@ public:
 
 const llvm::DenseMap<BuiltinType::Kind, StringRef>
     BuiltinPrintGenerator::TypeSpecifiers = {
-        {BuiltinType::Char_S, "%c"},
-        {BuiltinType::Char_U, "%c"},
-        {BuiltinType::Short, "%hd"},
-        {BuiltinType::UShort, "%hu"},
-        {BuiltinType::Int, "%d"},
-        {BuiltinType::UInt, "%u"},
-        {BuiltinType::Long, "%ld"},
-        {BuiltinType::ULong, "%lu"},
-        {BuiltinType::LongLong, "%lld"},
-        {BuiltinType::ULongLong, "%llu"},
+        {BuiltinType::Char_S, "c"},     {BuiltinType::Char_U, "c"},
+        {BuiltinType::Short, "hd"},     {BuiltinType::UShort, "hu"},
+        {BuiltinType::Int, "d"},        {BuiltinType::UInt, "u"},
+        {BuiltinType::Long, "ld"},      {BuiltinType::ULong, "lu"},
+        {BuiltinType::LongLong, "lld"}, {BuiltinType::ULongLong, "llu"},
 };
 } // namespace
 
@@ -1184,8 +1260,6 @@ static ExprResult BuiltinPrint(Sema &S, CallExpr *TheCall) {
   auto NewFormat = generator.GeneratePrintfFormat();
   if (!NewFormat)
     return ExprError();
-
-  llvm::errs() << "Format string = " << NewFormat << '\n';
 
   return generator.BuildCall(*NewFormat);
 }

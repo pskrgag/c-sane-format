@@ -35,10 +35,20 @@ It could be used in following ways:
     __builtin_print("{1} + {0} = {2}\n", printf, a, b, a + b); // prints "20 + 10 = 30"
 ```
 
-Planning to add support for custom format specifiers:
-    - Hex (if makes sense)
-    - String modifications
-    - ...
+```c
+    // Hex
+    int a = 10 , b = 20;
+    __builtin_print("{a:x}\n"); // prints "a"
+    __builtin_print("{a:03x}\n"); // prints "00a"
+```
+
+See `example.c` for more examples (which I currently use for testing).
+
+Planning to add support for:
+    - More %s stuff
+    - Rust filling and alignment
+    - More sanity checking
+    - More testing
 
 Also wondering if there could be some kind of "specifiers database", which could be loaded into
 clang. This will be definitely useful for project with custom formatting (like Linux Kernel)
