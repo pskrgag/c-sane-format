@@ -10,7 +10,9 @@ int main(void)
 	print("{a} + {b} = {}\n", a + b);
 	print("{a} + {b} = {0}\n", a + b);
 	print("{1} + {0} = {2}\n", a, b, a + b);
-	print("a = {a:03x}\n", a);
-	print("a = {a:-3} hello\n", a);
-	print("a = {a:3} hello\n", a);
+	print("a = {a:03x}\n");
+	print("a = {a:x}\n");
+	print("a = {a:-3} hello\n");
+	print("a = {a:3} hello\n");
+	print("a = {}", &a);
 }

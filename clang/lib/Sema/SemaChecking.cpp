@@ -816,9 +816,7 @@ public:
   }
 
   std::optional<std::size_t> SkipPred(std::function<bool(char)> Fn) {
-    while (GetPred(Fn)) {
-    }
-
+    while (GetPred(Fn)) {}
     return {};
   }
 
@@ -1199,11 +1197,7 @@ public:
 
   Expr *BuildCall(StringRef Str) {
     ASTContext &Context = S.getASTContext();
-    QualType StrTy =
-        Context.getStringLiteralArrayType(Context.CharTy, Str.size());
-    StringLiteral *Format =
-        StringLiteral::Create(Context, Str, StringLiteralKind::Ordinary, false,
-                              StrTy, &Loc, Str.size());
+    Expr *Format = new (S.Context) ParenExpr(Loc, Loc, S.Context.getPredefinedStringLiteralFromCache(Str));
     SmallVector<Expr *, 32> RealArgs;
 
     RealArgs.push_back(Format);
@@ -1230,6 +1224,7 @@ const llvm::DenseMap<BuiltinType::Kind, StringRef>
         {BuiltinType::Int, "d"},        {BuiltinType::UInt, "u"},
         {BuiltinType::Long, "ld"},      {BuiltinType::ULong, "lu"},
         {BuiltinType::LongLong, "lld"}, {BuiltinType::ULongLong, "llu"},
+        {BuiltinType::Bool, "d"},
 };
 } // namespace
 
